@@ -80,6 +80,7 @@
 
 mod bitcode;
 mod container;
+mod deps;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(test)]

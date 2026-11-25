@@ -127,6 +127,31 @@ compiled by the display driver the first time each is used.
 - With the in-game phone out the world is unlit (see the table).
 - The per-draw descriptor slots are few for the heaviest places: when they
   run out, some draws of a frame are dropped.
+- On NVIDIA (an RTX 4080, 2026-11-25): most of the world does not draw.
+  Three causes, in the order they cost the picture:
+  1. D3D12 caps one shader-visible CBV/SRV/UAV heap at 1,000,000 slots, where
+     the title's heap is 1,245,184 (the AMD driver takes the oversize heap, so
+     this never showed). The capped heap is now split toward the tables a
+     draw has made afresh (`VICTORY_DYNAMIC_SLOTS`, diagnostics, moves the
+     split): with 65,536 dynamic slots up to 1,700 mesh draws a frame were
+     dropped for want of one; with 524,288 none were. Views the title keeps
+     above the cap still have no host slot.
+  2. The `PSV0` (Pipeline State Validation) part used to fail the DXIL
+     validator for 17,597 of the 25,330 translated shaders (`Container part
+     'Pipeline State Validation' does not match expected for module`), and
+     NVIDIA's driver refused those pipelines (`host pipeline refused`,
+     `Unspecified error (0x80004005)`) where AMD's ran them. Fixed: the
+     part's name table lists one string per arbitrary-semantic element in
+     element order, which is how the validator writes it; sharing a name
+     between two elements (`TEXCOORD1` and `TEXCOORD2`) put a different
+     offset in the second one and the part was compared byte for byte.
+     `victory precompile --validate` now reports all 25,367 shaders
+     validated.
+  3. Every console wave64 compute program is refused on a 32-lane host (293
+     of 2,682), and those passes (ray-traced shadows and light, alpha
+     transmission) never run: `docs/wave64-on-wave32.md` step 6.
+  The frame rate on that card was 1 to 3 fps, with 190 to 450 ms of GPU time
+  and 85 to 330 ms of CPU time a frame.
 - Memory: the process commits about 33 GB after a quarter of an hour's
   drive (the title's own 7 GB, 8 GB of textures on the card, copies of its
   buffers, and the system's backing of video memory).

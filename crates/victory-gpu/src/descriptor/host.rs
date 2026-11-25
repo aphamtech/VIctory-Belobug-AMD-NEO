@@ -512,8 +512,11 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`]. A capped host has to split that one heap between the
+/// title's slots and the tables a draw has made afresh; 65,536 dynamic slots
+/// ran out on NVIDIA (RTX 4080: mesh draws dropped with "a table not made",
+/// up to 1,700 a frame), and 524,288 left no such drop in the same place.
+const DYNAMIC_CAPPED: u32 = 1 << 19;
 
 /// [`DYNAMIC_CAPPED`], or `VICTORY_DYNAMIC_SLOTS` when it names a reserve
 /// that fits (diagnostics): the capped heap is split between the title's

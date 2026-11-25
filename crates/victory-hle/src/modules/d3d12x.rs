@@ -61,16 +61,17 @@ pub fn host_wave_target() -> Option<(u32, u32)> {
 
 /// Translates the console shader `container` for waves of `lanes` straight
 /// into the shader cache a run reads (with [`use_shader_cache`]), so the
-/// run finds it there instead of translating it at pipeline creation.
-/// `Ok(true)`: the cache already held it.
-pub fn precompile_shader(container: &[u8], lanes: (u32, u32)) -> Result<bool, String> {
+/// run finds it there instead of translating it at pipeline creation. The
+/// emitted DXIL container comes back with it (for `--validate`), and
+/// `true` when the cache already held the translation.
+pub fn precompile_shader(container: &[u8], lanes: (u32, u32)) -> Result<(Vec<u8>, bool), String> {
     #[cfg(windows)]
     {
         let target = victory_gpu::shader_cache::Target {
             lanes_min: lanes.0,
             lanes_max: lanes.1,
         };
-        victory_gpu::shader_cache::warm(container, target).map(|(_, hit)| hit)
+        victory_gpu::shader_cache::warm(container, target).map(|(shader, hit)| (shader.dxil, hit))
     }
     #[cfg(not(windows))]
     {

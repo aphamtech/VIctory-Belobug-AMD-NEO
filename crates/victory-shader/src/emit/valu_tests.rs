@@ -235,6 +235,7 @@ fn data_only_structured_srv_reads_its_bound_record_count() {
             outputs: &[],
             prims: &[],
             mesh: None,
+            deps: &[],
             rectangles: false,
             bindings,
             threads: [1, 1, 1],

@@ -188,6 +188,9 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Input-to-output dependence masks ([`super::deps::masks`]): one dword
+    /// per input scalar, one bit per output scalar.
+    pub deps: &'a [u32],
     /// Geometry: triangles to strips (see `Shader::rectangles`).
     pub rectangles: bool,
     pub bindings: &'a [Binding],
@@ -263,19 +266,16 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     // Names of arbitrary semantics (system values use ""), then indices.
+    // One name per element in element order, repeats included: the validator
+    // compares this table byte for byte against the one it writes, and it
+    // does not share names between elements.
     let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            strings.extend(e.name.bytes().chain([0]));
+            strings.len() - e.name.len() - 1
         } else {
             0
         };
@@ -304,38 +304,10 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend([1, start, cols, e.kind, e.sig_comp() as u8, e.interp, 0, 0]);
         }
     }
-    // Input-to-output dependencies, as the view-id state declares them:
-    // every output scalar on every input scalar.
-    if in_vectors > 0 && out_vectors > 0 {
-        let scalars = |els: &[SigElement]| {
-            els.iter()
-                .filter_map(|e| e.row.map(|r| r * 4 + u32::from(e.col + e.cols)))
-                .max()
-                .unwrap_or(0)
-        };
-        let (ni, no) = (scalars(p.inputs), scalars(p.outputs));
-        let per = (out_vectors * 4).div_ceil(32);
-        for i in 0..in_vectors * 4 {
-            for k in 0..per {
-                let bits = if i < ni {
-                    no.saturating_sub(32 * k).min(32)
-                } else {
-                    0
-                };
-                let mask = if bits == 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << bits) - 1
-                };
-                u32s(&mut out, &[mask]);
-            }
-        }
-    }
+    // Input-to-output dependence masks, as the module's dataflow has them
+    // (the validator checks these against the module, byte for byte).
+    u32s(&mut out, p.deps);
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.

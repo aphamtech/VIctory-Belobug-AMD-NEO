@@ -628,31 +628,31 @@ impl Shader {
         }
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
+        // What each signature input scalar reaches in the signature outputs:
+        // the driver reads it, and the validator checks `PSV0`'s copy of it.
+        let deps = if graphics {
+            super::deps::masks(&self.m, &self.inputs, &self.outputs)
+        } else {
+            Vec::new()
+        };
         if graphics {
-            // shortcut: every output is declared to depend on every input; the
-            // exact sets need a dependence pass. Drivers read this state.
-            let scalars = |els: &[SigElement]| {
+            // The view-id state lists the same masks: one dword per input
+            // scalar (in vectors of four), then those of the primitive
+            // outputs of a mesh shader.
+            let rows = |els: &[SigElement]| {
                 els.iter()
-                    .filter_map(|e| e.row.map(|r| r * 4 + u32::from(e.col + e.cols)))
+                    .filter_map(|e| e.row)
                     .max()
-                    .unwrap_or(0)
+                    .map_or(0, |r| r + 1)
+                    * 4
             };
-            let (ni, no) = (scalars(&self.inputs), scalars(&self.outputs));
+            let (ni, no) = (rows(&self.inputs), rows(&self.outputs));
             let mut view = vec![ni, no];
             // Mesh shaders have no inputs: then the primitive outputs' count.
             if self.mesh.is_some() {
-                view.push(scalars(&self.prims));
+                view.push(rows(&self.prims));
             }
-            for _ in 0..ni {
-                for k in 0..no.div_ceil(32) {
-                    let bits = (no - 32 * k).min(32);
-                    view.push(if bits == 32 {
-                        u32::MAX
-                    } else {
-                        (1 << bits) - 1
-                    });
-                }
-            }
+            view.extend(&deps);
             // Geometry shaders list four streams; ours use the first.
             if self.rectangles {
                 view.extend([0; 3]);
@@ -814,6 +814,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            deps: &deps,
             rectangles: self.rectangles,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),

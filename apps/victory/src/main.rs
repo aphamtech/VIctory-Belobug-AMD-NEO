@@ -108,6 +108,11 @@ enum Command {
         /// Fail (exit status 1) when a shader could not be translated.
         #[arg(long)]
         strict: bool,
+        /// Check every emitted shader with dxil.dll's validator
+        /// (`VICTORY_DXIL`, else the newest Windows SDK's) and report the
+        /// ones the host's driver would refuse.
+        #[arg(long)]
+        validate: bool,
         /// No progress window (it shows the counts and the rate).
         #[arg(long)]
         no_gui: bool,
@@ -186,8 +191,9 @@ fn main() -> Result<()> {
             host_lanes,
             jobs,
             strict,
+            validate,
             no_gui,
-        } => precompile::run(paths, host_lanes, jobs, strict, !no_gui),
+        } => precompile::run(paths, host_lanes, jobs, strict, !no_gui, validate),
         Command::Run {
             exe,
             unimplemented,

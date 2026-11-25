@@ -162,6 +162,73 @@ thread_local! {
 ///   it keeps the per-lane form ([`Parts::per_lane_only`]).
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
+/// LDS instructions that need a group barrier before them, as (block,
+/// instruction) of the console's program.
+///
+/// A console compiler leaves barriers out between the lanes of one wave,
+/// which runs its instructions in order: a lane that writes a slot and a
+/// lane that reads it are the same wave, so the read comes after the write
+/// without a barrier. Split in halves the two are different host waves,
+/// which drift apart, so every read a write may have reached gets one. The
+/// console flow reaches every instruction whatever EXEC holds, so both
+/// halves are at every barrier.
+fn lds_barriers(p: &Program) -> HashSet<(usize, usize)> {
+    // `ds_swizzle`, `ds_(b)permute` and `ds_nop` do not touch LDS memory;
+    // the queues and wave-synchronisation operations are refused anyway.
+    let memory = |n: &str| {
+        n.starts_with("ds_")
+            && !matches!(n, "ds_nop" | "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32")
+            && !n.starts_with("ds_gws")
+            && !matches!(n, "ds_append" | "ds_consume" | "ds_ordered_count")
+    };
+    // Atomics read what they update, so only the plain writes are write-only.
+    let reads = |n: &str| memory(n) && !n.contains("write");
+    let n = p.blocks.len();
+    let mut reach = vec![vec![false; n]; n];
+    for (b, block) in p.blocks.iter().enumerate() {
+        for s in block.exit.successors() {
+            reach[b][s] = true;
+        }
+    }
+    for k in 0..n {
+        for i in 0..n {
+            if reach[i][k] {
+                for j in 0..n {
+                    reach[i][j] |= reach[k][j];
+                }
+            }
+        }
+    }
+    let writes: Vec<usize> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| {
+            block
+                .insts
+                .iter()
+                .any(|i| memory(i.name()) && !reads(i.name()))
+        })
+        .map(|(b, _)| b)
+        .collect();
+    let mut sync = HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        // A write of another block reaches this one: its reads are behind
+        // one before the block's own first write.
+        let mut since = writes.iter().any(|&wb| wb != b && reach[wb][b]);
+        for (i, inst) in block.insts.iter().enumerate() {
+            if memory(inst.name()) && !reads(inst.name()) {
+                since = true;
+            } else if reads(inst.name()) && since {
+                // One barrier covers the reads up to the block's next write.
+                sync.insert((b, i));
+                since = false;
+            }
+        }
+    }
+    sync
+}
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -526,6 +593,10 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// LDS instructions needing a group barrier before them (block and
+    /// instruction): a lane of the other half may have written what they
+    /// read, and the console compiler left that barrier out.
+    lds_sync: HashSet<(usize, usize)>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -1111,6 +1182,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
+        let mut lds_sync = HashSet::new();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1176,6 +1248,14 @@ impl<'a> Lower<'a> {
             console_lanes = reads_whole || masks_held || live().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            // LDS shared within one console wave, where the console compiler
+            // leaves out the barriers: split in halves, both are needed
+            // again, and only the console flow puts every thread of the group
+            // at them. Treat such a program as reading other lanes when the
+            // host cannot run the wave it was compiled for.
+            if one_wave && s.lds_dwords > 0 && x.native.wave64 && !x.target.runs(64) {
+                console_lanes = true;
+            }
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
             // lane reads is in its host wave, at its host lane's place in the
@@ -1192,13 +1272,15 @@ impl<'a> Lower<'a> {
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
+            // for a group of one console wave. Its LDS works too: the halves
+            // are two host waves where the console had one, so a read that a
+            // lane of the other half may have written needs a group barrier,
+            // which every thread of the group reaches (see `lds_barriers`).
             wants_console_flow = console_lanes
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
@@ -1228,6 +1310,10 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            // Split halves, and LDS another lane may have written.
+            if split && s.lds_dwords > 0 && cs.threads.iter().product::<u32>() > 32 {
+                lds_sync = lds_barriers(p);
             }
         }
         let mut no_barrier = HashSet::new();
@@ -1319,6 +1405,7 @@ impl<'a> Lower<'a> {
             wants_console_flow,
             console_flat: None,
             xchg: None,
+            lds_sync,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1957,6 +2044,27 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Why the console flow cannot take this wave64 program on a host
+    /// without 64-lane waves: the reason to report when it stops.
+    fn console_flow_blocked(&self) -> Option<&'static str> {
+        let threads: u32 = self.s.threads?.iter().product();
+        let p = self.x.p;
+        if threads > 64 {
+            Some("a wave64 group of several console waves on a host without 64-lane waves")
+        } else if p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name().contains("permute"))
+        {
+            Some("a lane permutation in a wave64 group on a host without 64-lane waves")
+        } else if (0..p.blocks.len()).any(|b| !super::wave::sections(p, b).is_empty()) {
+            Some("a whole-wave section in a wave64 group on a host without 64-lane waves")
+        } else {
+            None
+        }
+    }
+
     fn lower_ir(&mut self) -> Result<Vec<UserData>, Stop> {
         if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
@@ -1970,7 +2078,9 @@ impl<'a> Lower<'a> {
             return Err(unsupported(
                 0,
                 match (n, self.console_lanes) {
-                    (64, true) => "console wave64 lanes on a host without 64-lane waves",
+                    (64, true) => self.console_flow_blocked().unwrap_or(
+                        "console wave64 lanes on a host without 64-lane waves",
+                    ),
                     (64, false) => {
                         "a wave64 group sharing LDS without barriers on a host without 64-lane waves"
                     }
@@ -4702,6 +4812,13 @@ impl<'a> Lower<'a> {
         }
         if name.starts_with("ds_gws") || matches!(name, "ds_append" | "ds_consume" | "ds_ordered_count") {
             return Err("an LDS or GDS queue or global wave synchronization operation");
+        }
+        if self.lds_sync.contains(&(b, i)) {
+            // The other half may have written what this reads: the console
+            // needed no barrier, one wave running in order.
+            let mode = self.s.m.i32(1 | 8);
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         let byte = |l: &mut Self, bytes: u32| {

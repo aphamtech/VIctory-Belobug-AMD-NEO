@@ -133,7 +133,7 @@ pub(crate) mod pred {
 }
 
 #[derive(Debug, Clone)]
-enum Op {
+pub(crate) enum Op {
     Bin(Bin, V, V),
     Cast(Cast, V),
     Cmp(u8, V, V),
@@ -217,6 +217,24 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// The op of an instruction value, for the dependence pass.
+    pub(crate) fn op_of(&self, v: V) -> Option<&Op> {
+        match v {
+            V::Inst(i) => Some(&self.insts[i as usize].op),
+            _ => None,
+        }
+    }
+
+    /// Every instruction, in block order.
+    pub(crate) fn instruction_ids(&self) -> impl Iterator<Item = V> + '_ {
+        (0..self.insts.len() as u32).map(V::Inst)
+    }
+
+    /// The name of a function (`dx.op.loadInput.f32` and the like).
+    pub(crate) fn func_name(&self, f: u32) -> &str {
+        &self.funcs[f as usize].name
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use victory_shader::emit::validator::Validator;
 use victory_shader::{Container, FourCC};
 
 use crate::progress::Progress;
@@ -28,6 +29,10 @@ struct Tally {
     /// Translations the cache already held, and ones made now.
     cached: usize,
     translated: usize,
+    /// With `--validate`: the emitted containers dxil.dll accepted, and
+    /// those it did not, by its first line.
+    validated: usize,
+    invalid: BTreeMap<String, (usize, String)>,
     /// Containers that failed, by the translator's first line, with an
     /// example of one.
     failed: BTreeMap<String, (usize, String)>,
@@ -42,13 +47,28 @@ impl Tally {
             .0 += 1;
     }
 
+    fn reject(&mut self, reason: &str, example: impl FnOnce() -> String) {
+        let reason = reason.lines().next().unwrap_or_default().to_owned();
+        self.invalid
+            .entry(reason)
+            .or_insert_with(|| (0, example()))
+            .0 += 1;
+    }
+
     fn merge(&mut self, other: Tally) {
         self.containers += other.containers;
         self.duplicates += other.duplicates;
         self.cached += other.cached;
         self.translated += other.translated;
+        self.validated += other.validated;
         for (reason, (n, example)) in other.failed {
             self.failed
+                .entry(reason)
+                .or_insert_with(|| (0, example))
+                .0 += n;
+        }
+        for (reason, (n, example)) in other.invalid {
+            self.invalid
                 .entry(reason)
                 .or_insert_with(|| (0, example))
                 .0 += n;
@@ -62,6 +82,7 @@ pub fn run(
     jobs: Option<usize>,
     strict: bool,
     gui: bool,
+    validate: bool,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let lanes = match host_lanes {
@@ -76,6 +97,15 @@ pub fn run(
     victory_hle::modules::d3d12x::use_shader_cache(dir.clone());
     println!("host waves   {}-{} lanes", lanes.0, lanes.1);
     println!("shader cache {}", dir.display());
+    let dll = validate.then(victory_shader::emit::validator::Validator::default_path).flatten();
+    if validate {
+        victory_shader::emit::validator::Validator::load(dll.as_deref())
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "validator    {}",
+            dll.as_ref().map_or("dxil.dll".into(), |p| p.display().to_string())
+        );
+    }
     let progress = gui.then(|| Progress::new("VIctory - precompiling shaders"));
 
     let started = Instant::now();
@@ -111,9 +141,14 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally::default();
                         let counter = progress.as_ref().map(Progress::counter);
+                        let mut validator = validate
+                            .then(|| {
+                                victory_shader::emit::validator::Validator::load(dll.as_deref()).ok()
+                            })
+                            .flatten();
                         while let Some(source) = containers.get(next.fetch_add(1, Ordering::Relaxed))
                         {
-                            let outcome = one(source, path, lanes, &seen, &mut t);
+                            let outcome = one(source, path, lanes, &seen, &mut t, &mut validator);
                             if let (Some(counter), Some(hit)) = (&counter, outcome.outcome()) {
                                 counter.container(hit);
                             }
@@ -147,6 +182,18 @@ pub fn run(
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for (reason, (n, example)) in &failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
+    }
+    if validate {
+        println!(
+            "DXIL         {} of {} validated",
+            t.validated,
+            t.validated + t.invalid.values().map(|f| f.0).sum::<usize>()
+        );
+        let mut invalid: Vec<_> = t.invalid.into_iter().collect();
+        invalid.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        for (reason, (n, example)) in &invalid {
+            println!("  {n:>7}  {reason}  (e.g. {example})");
+        }
     }
     println!(
         "cache        {} entries, {:.0} MB; {:.1} s",
@@ -188,6 +235,7 @@ fn one(
     lanes: (u32, u32),
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
+    validator: &mut Option<Validator>,
 ) -> Done {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -213,11 +261,17 @@ fn one(
         return Done::Skipped;
     }
     match victory_hle::modules::d3d12x::precompile_shader(&bytes, lanes) {
-        Ok(hit) => {
+        Ok((mut dxil, hit)) => {
             if hit {
                 t.cached += 1;
             } else {
                 t.translated += 1;
+            }
+            if let Some(validator) = validator {
+                match validator.validate(&mut dxil) {
+                    Ok(()) => t.validated += 1,
+                    Err(e) => t.reject(&e, example),
+                }
             }
             Done::Counted(hit)
         }

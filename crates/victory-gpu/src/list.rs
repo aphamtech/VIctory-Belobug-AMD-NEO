@@ -161,6 +161,14 @@ pub(crate) struct Submitted(Arc<crate::host::HostList>);
 unsafe impl Send for Submitted {}
 
 #[cfg(windows)]
+impl Submitted {
+    /// The host list itself, to keep past the submission's return.
+    pub(crate) fn shared(&self) -> Arc<crate::host::HostList> {
+        self.0.clone()
+    }
+}
+
+#[cfg(windows)]
 impl std::ops::Deref for Submitted {
     type Target = crate::host::HostList;
     fn deref(&self) -> &crate::host::HostList {

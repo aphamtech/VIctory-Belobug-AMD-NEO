@@ -515,6 +515,23 @@ const DYNAMIC: u32 = 1 << 20;
 /// [`PORTABLE_VIEWS`].
 const DYNAMIC_CAPPED: u32 = 1 << 16;
 
+/// [`DYNAMIC_CAPPED`], or `VICTORY_DYNAMIC_SLOTS` when it names a reserve
+/// that fits (diagnostics): the capped heap is split between the title's
+/// slots and the tables a draw has made afresh, and only a run shows which
+/// side needs more of it.
+fn dynamic_capped() -> u32 {
+    #[cfg(feature = "diagnostics")]
+    if let Some(n) = std::env::var("VICTORY_DYNAMIC_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        && (1 << 12..=PORTABLE_VIEWS - crate::memory::SLOTS - (1 << 12)).contains(&n)
+    {
+        tracing::warn!(dynamic = n, "VICTORY_DYNAMIC_SLOTS: the capped heap is split differently");
+        return n;
+    }
+    DYNAMIC_CAPPED
+}
+
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
@@ -585,17 +602,19 @@ impl HostHeap {
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                let dynamic = dynamic_capped();
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = PORTABLE_VIEWS - dynamic,
+                    lost = wanted + dynamic - PORTABLE_VIEWS,
+                    dynamic,
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
+                    PORTABLE_VIEWS - dynamic - crate::memory::SLOTS,
+                    dynamic,
                 )
             }
             Err(e) => {

@@ -89,6 +89,23 @@ victory run <game_scarlett_master.exe> --execute --console series-x
 The first launch after a build translates every shader and builds about
 2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
 
+The translations can be done ahead of the run instead, in a step of its own,
+so the loading screen does not pay for them:
+
+```
+victory precompile              # every shader in the game folder, into the cache the run reads
+victory precompile --no-gui     # the same, without the progress window
+victory precompile --jobs 16    # worker threads (default: every logical core)
+```
+
+It reads everything under the game folder (shaders are not only in
+`shaders.rpf`), takes about two minutes on 16 threads, writes about 1.2 GB to
+the cache folder and reports what cannot be translated, with an example of
+each. The entries are keyed by the `victory.exe` that made them, so run it
+after every rebuild; a diagnostics build can reuse another build's entries
+with `VICTORY_SHADER_BUILD_OF=<executable>`. Pipelines themselves are still
+compiled by the display driver the first time each is used.
+
 ### Known problems
 
 - With the in-game phone out the world is unlit (see the table).

@@ -14,7 +14,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, UserData};
+pub use victory_shader::emit::Target;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -80,6 +81,13 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one.
 pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
+    warm(container, target).map(|(shader, _)| shader)
+}
+
+/// [`host_shader`], and whether the cache already held the translation
+/// (false: it was translated and stored now). A step that translates the
+/// title's shaders ahead of a run goes through this.
+pub fn warm(container: &[u8], target: Target) -> Result<(HostShader, bool), String> {
     let translate =
         |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
@@ -96,8 +104,16 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
             }
             cached(cache, &key, container, translate)
         }
-        None => translate(container),
+        None => translate(container).map(|shader| (shader, false)),
     }
+}
+
+/// The wave sizes this host's GPU runs, when a device can be made: what a
+/// run translates its shaders for, and so what a step translating them
+/// ahead of time must use (`None`: no host GPU with shader model 6.6).
+pub fn host_wave_target() -> Option<(u32, u32)> {
+    let target = crate::host::host()?.target();
+    Some((target.lanes_min, target.lanes_max))
 }
 
 /// The part of an entry's key before the container: the build, and the
@@ -131,12 +147,13 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+/// The translation of `container`, and whether it came from the cache.
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
+) -> Result<(HostShader, bool), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -147,20 +164,21 @@ fn cached(
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
+            let hit = !converter.ran.load(Ordering::Relaxed);
+            let (counter, what) = if hit {
                 (&HITS, "from the cache")
+            } else {
+                (&MISSES, "translated and cached")
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, hit));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    (converter.translate)(container).map(|shader| (shader, false))
 }
 
 const MAGIC: &[u8; 4] = b"VSH2";
@@ -353,21 +371,37 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, translate),
+            Ok((shader(), false))
+        );
+        assert_eq!(
+            cached(&cache, &build, container, translate),
+            Ok((shader(), true)),
+            "the second came from disk"
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &[8; 32], container, translate),
+            Ok((shader(), false))
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, translate),
+            Ok((shader(), false))
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, translate),
+            Ok((shader(), true))
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.

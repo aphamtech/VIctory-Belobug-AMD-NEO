@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+mod precompile;
+mod progress;
 mod run;
 mod shader;
 mod translate;
@@ -91,6 +93,25 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate every shader found into the shader cache a run reads, so a
+    /// first launch does not translate them while the loading screen waits.
+    /// Run it with the same environment (and the same build) as the run.
+    Precompile {
+        paths: Vec<PathBuf>,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA). Default: ask the host GPU.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Fail (exit status 1) when a shader could not be translated.
+        #[arg(long)]
+        strict: bool,
+        /// No progress window (it shows the counts and the rate).
+        #[arg(long)]
+        no_gui: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -160,6 +181,13 @@ fn main() -> Result<()> {
             jobs,
             host_lanes,
         } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        Command::Precompile {
+            paths,
+            host_lanes,
+            jobs,
+            strict,
+            no_gui,
+        } => precompile::run(paths, host_lanes, jobs, strict, !no_gui),
         Command::Run {
             exe,
             unimplemented,

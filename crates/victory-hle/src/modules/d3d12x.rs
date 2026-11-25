@@ -49,6 +49,36 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// The wave sizes a run on this host translates its shaders for, when its
+/// GPU can be asked: `(32, 32)` on NVIDIA, `(32, 64)` on AMD RDNA. `None`
+/// on a host without a Direct3D 12 device at shader model 6.6.
+pub fn host_wave_target() -> Option<(u32, u32)> {
+    #[cfg(windows)]
+    return victory_gpu::shader_cache::host_wave_target();
+    #[cfg(not(windows))]
+    None
+}
+
+/// Translates the console shader `container` for waves of `lanes` straight
+/// into the shader cache a run reads (with [`use_shader_cache`]), so the
+/// run finds it there instead of translating it at pipeline creation.
+/// `Ok(true)`: the cache already held it.
+pub fn precompile_shader(container: &[u8], lanes: (u32, u32)) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let target = victory_gpu::shader_cache::Target {
+            lanes_min: lanes.0,
+            lanes_max: lanes.1,
+        };
+        victory_gpu::shader_cache::warm(container, target).map(|(_, hit)| hit)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (container, lanes);
+        Err("no shader translation on this host".to_owned())
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
